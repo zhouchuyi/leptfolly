@@ -10,378 +10,274 @@
 #include<vector>
 #include<limits>
 
+#define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
+constexpr uint32_t InvalidEntryId = std::numeric_limits<uint32_t>::max();
 
-constexpr uint32_t kEntryIDINvalid = std::numeric_limits<uint32_t>::max();
+class ThreadEntry;
 
-enum class DestructionMode {THIS_THREAD, ALL_THREAD};
-
-struct AccessModeStrict {};
-
-struct ThreadEntry;
-
-struct ThreadEntryNode
+class ThreadEntryNode
 {
-    uint32_t id;
-    ThreadEntry* parent;
-    ThreadEntry* prev;
-    ThreadEntry* next;
+public:
 
-    void initIfZero(bool locked);
-
-    void init(ThreadEntry* entry,uint32_t newId)
+    ThreadEntry* parent_;    
+    ThreadEntry* next_;
+    ThreadEntry* prev_;
+    uint32_t id_;
+public:
+    
+    // invoked when reserve ThreadEntry and head
+    //init node in threadentry
+    void initZero(ThreadEntry* t,uint32_t id)
     {
-        next = prev = parent = entry;
-        id = newId;
+        assert(t && id != InvalidEntryId);
+        parent_ = t;
+        id_ = id;
+        prev_ = next_ = nullptr;
+    }
+    //invoked to init the node onm head
+    void init(ThreadEntry* t,uint32_t id)
+    {
+        assert(t && id != InvalidEntryId);
+        id_ = id;
+        parent_ = prev_ = next_ = t;
     }
 
-    void initZero(ThreadEntry* entry,uint32_t newId)
-    {
-        parent = entry;
-        prev = next = nullptr;
-        id = newId;
-    }
+    void initIfZero();
+   
+    void eraseZero();
 
+    ThreadEntryNode* getNext();
+    
+    ThreadEntryNode* getPrev();
+
+    // push the node , head is &head_ in StaticMeta
+    void push_back(ThreadEntry* head);
+
+    ThreadEntry* getThreadEntry()
+    {
+        return parent_;
+    }
+    
     bool empty() const
     {
-        return (next == parent);
+        return (next_ == prev_);
     }
-
-    ThreadEntry* getParentEntry() 
-    {
-        return parent;
-    
-    }
-
-    inline __attribute__((__always_inline__)) ThreadEntryNode* getPrev();
-
-    inline __attribute__((__always_inline__)) ThreadEntryNode* getNext();
-
-    // add *this between head and head->prev
-    void push_back(ThreadEntry* head);
-    
-    void eraseZero();
 
 };
 
-struct ElementWrapper
+
+
+//TODO add usr's own deleter
+struct Element
 {
-    using DeleteFunctype = void(void*,DestructionMode);
-    
-    bool dispose(DestructionMode mode) 
-    {
-        if(ptr == nullptr)
-            return false;
-        ownsDeleter ?  (*delete2)(ptr,mode) : (*delete1)(ptr,mode) ;
-    }
-
-    void* release()
-    {
-        void* resptr = ptr;
-        if(ptr != nullptr)
-            cleanup();
-        return resptr;
-    }   
-
+    using DeleteType = void(void* ptr);
+    //called after StaticMeta::get
+    //TODO
     template<typename Ptr>
     void set(Ptr p)
     {
         if(p)
         {
-            ptr = p;
-            node.initIfZero(true);
-            delete1 = [](void* p_,DestructionMode){
-                    delete static_cast<Ptr>(p_);
-                                                    };
+            //add node to the double list
+            node_.initIfZero();
+            ptr_ = static_cast<void*>(p);
+            deleter_ = [](void* ptr){ delete static_cast<Ptr>(ptr); };
         
-            ownsDeleter = false;
         }
     }
 
-    template<typename Ptr>
-    void set(Ptr p,const std::function<DeleteFunctype>& d)
+    bool dispose()
     {
-        if(p)
-        {
-            ptr = p;
-            node.initIfZero(true);
-            delete2 = new std::function<DeleteFunctype>(d);
-            ownsDeleter = true;
-        }
+        if(ptr_ == nullptr)
+            return false;
+        (*deleter_)(ptr_);
+        cleanup();
+        return true;
     }
 
     void cleanup()
     {
-        if(ownsDeleter)
-            delete delete2;
-        ptr = nullptr;
-        delete1 = nullptr;
-        ownsDeleter = false;
+        ptr_ = nullptr;
+        deleter_ = nullptr;
     }
 
-    void* ptr;
-    ThreadEntryNode node;
-    bool ownsDeleter;
-    union 
-    {
-        DeleteFunctype* delete1;
-        std::function<DeleteFunctype>* delete2;
-    };
-    
+
+    ThreadEntryNode node_;
+    void* ptr_;
+    DeleteType* deleter_;
 };
 
-
-struct StaticMetaBase;
-struct ThreadEntryList;
-
+class StaticMetaBase;
 
 struct ThreadEntry
 {
-    ElementWrapper* element{nullptr};
-    std::atomic<size_t> elementsCapacity{0};
-    ThreadEntry* next{nullptr};
-    ThreadEntry* prev{nullptr};
-    ThreadEntryList* list{nullptr};
-    ThreadEntry* listNext{nullptr};
+    ThreadEntry* next_{nullptr};
+    ThreadEntry* prev_{nullptr};
+    Element* elements_{nullptr};
+    std::atomic<size_t> capacity_{};
     StaticMetaBase* meta{nullptr};
-    bool removed_{false};
 
-    size_t getElementsCapacity() const noexcept
+    size_t getElementCapacity() const
     {
-        return elementsCapacity.load(std::memory_order_relaxed);        
+        return capacity_.load(std::memory_order_relaxed);
+    }
+    
+    void setElementCapacity(size_t capacity)
+    {
+        capacity_.store(capacity,std::memory_order_relaxed);
     }
 
-    void setElementCapacity(size_t capacity) noexcept
-    {
-        elementsCapacity.store(capacity,std::memory_order_acquire);
-    }
+    
+
 };
 
 
-struct ThreadEntryList
+
+
+class StaticMetaBase
 {
-    ThreadEntry* head{nullptr};
-    size_t count{0};
-};
-
-inline __attribute__((__always_inline__)) ThreadEntryNode* ThreadEntryNode::getPrev()
-{
-    return &prev->element[id].node;
-}
-
-inline __attribute__((__always_inline__)) ThreadEntryNode* ThreadEntryNode::getNext()
-{
-    return &next->element[id].node;
-}
-
-class PthreadKeyUnregister
-{
-private:
-    constexpr static size_t kMaxSize = 1UL<<16;
-    std::mutex mutex_;
-    size_t size_;
-    pthread_key_t keys_[kMaxSize];
-
-    static PthreadKeyUnregister instance_;
-
-    void registerKeyImpl(pthread_key_t key)
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
-        keys_[size_++] = key;
-    }
-
-    constexpr PthreadKeyUnregister() :mutex_(),size_(0),keys_() {}
-
 public:
-    
-    ~PthreadKeyUnregister()
+
+    struct EntryID
     {
-        std::lock_guard<std::mutex> lk(mutex_);
-        while (size_)
-        {
-            pthread_key_delete(keys_[--size_]);
-        }
-    }
-
-    static void registerKey(pthread_key_t key)
-    {
-        if(key >= kMaxSize)
-            throw std::logic_error("pthread_key limit has already been reached");
-        instance_.registerKeyImpl(key);
-    }
-
-
-};
-
-
-
-
-
-struct StaticMetaBase
-{
-    using getThreadEntry = std::function<ThreadEntry*()>;
-    
-    class EntryID
-    {
-      public:
-
         std::atomic<uint32_t> value_;
-        EntryID() : value_(kEntryIDINvalid) {}
-        ~EntryID() = default;
 
-        EntryID(EntryID&& gonner) : value_(gonner.value_.load())
-        {
-            gonner.value_ = kEntryIDINvalid;
-        }
-        // noncopyable
-        EntryID(const EntryID&) = delete;
-        EntryID& operator=(const EntryID&) = delete;
-    
-        uint32_t getOrInvalid() 
+        EntryID() : value_(InvalidEntryId) {}
+
+        ~EntryID() = default;
+        //XXX relax ok?
+        uint32_t getID() const
         {
             return value_.load(std::memory_order_acquire);
         }
 
-        uint32_t getOrAllocate(StaticMetaBase& meta)
+        uint32_t getOrAllocate(StaticMetaBase* meta)
         {
-            uint32_t id = getOrInvalid();
-            if(id != kEntryIDINvalid)
-                return id;
-            return meta.allocate(this);
-        } 
-
+            uint32_t idval = getID();
+            if(idval == InvalidEntryId)
+            {
+                return meta->allocate(this);
+            }
+            
+            return idval;
+        }
+    
     };
 
-    StaticMetaBase(const getThreadEntry& threadEntry,bool strict);    
+    StaticMetaBase(const std::function<ThreadEntry*()>& threadEntry);
     ~StaticMetaBase()
     {
-        std::terminate();
+        free(head_.elements_);
     }
-    // add t between head_ and head_.prev
+
+    // Element* reallocate(uint32_t id);  
+
+    // void reserve(uint32_t id);
+
+    //add t to the list
     void push_back(ThreadEntry* t)
     {
-        t->next = &head_;
-        t->prev = head_.prev;
-        head_.prev->next = t;
-        head_.prev = t;
+        t->next_ = &head_;
+        t->prev_ = head_.prev_;
+
+        head_.prev_->next_ = t;
+        head_.prev_ = t;
     }
-    
+
     void erase(ThreadEntry* t)
     {
-        t->prev->next = t->next;
-        t->next->prev = t->prev;
-        t->next = t->prev = t;
+        t->next_->prev_ = t->prev_;
+        t->prev_->next_ = t->next_;
+        t->next_ = t->prev_ = nullptr;
     }
     
-    static ThreadEntryList* getThreadEntryList();
+    uint32_t allocate(EntryID* entry);
 
-    static bool dying();
+    static void onThreadExit(void*);
 
-    static void onThreadExit(void* ptr);
+    void pushBack(ThreadEntry* threadEntry,uint32_t id);
+    
+    void reserveHead(uint32_t idval);
 
-    uint32_t elementsCapacity() const;
+    void reserve(ThreadEntry* t,uint32_t id);
 
-    uint32_t allocate(EntryID* ent);
+    void destroy(EntryID* ent);
 
-    void destroy(EntryID* id);
-
-    void reserve(EntryID* id);
-
-    ElementWrapper& getElement(EntryID* id);
-
-    void reserveHeadUnlocked(uint32_t id);
-
-    void pushBackLocked(ThreadEntry* t,uint32_t id);
-    void pushBackUnLocked(ThreadEntry* t,uint32_t id);
-
-    static ElementWrapper*
-    reallocate(ThreadEntry* threadEntry, uint32_t idval,size_t& newCapacity);
-
-    uint32_t nextId_;
-    std::vector<uint32_t> freeIds_;
+    Element* reallocate(ThreadEntry* t,uint32_t idval,size_t& newcapacity);  
+    
     std::mutex mutex_;
-    pthread_key_t key_;
+    std::atomic<uint32_t> nextId_;
+    std::function<ThreadEntry*()> threadEntry_;
     ThreadEntry head_;
-    getThreadEntry threadEntry_;
-    bool strict_;
-
+    pthread_key_t key_; //to manage the ThreadEntry per thread
 };
 
 
-template<typename Tag,typename AccessMode>
-class StaticMeta final : StaticMetaBase
+class StaticMeta final : public StaticMetaBase
 {
-    StaticMeta() : StaticMetaBase(&StaticMeta::getThreadEntrySlow,
-                                std::is_same<AccessMode,AccessModeStrict>::value)
-    {
-        
-    }
+private:
+ 
+public:
+    StaticMeta() : StaticMetaBase(&StaticMeta::getThreadEntrySlow) {}
+    ~StaticMeta() = default;
 
-    static StaticMeta<Tag,AccessMode>& instance()
+    static StaticMeta& instance()
     {
-        static StaticMeta<Tag,AccessMode> meta;
+        static StaticMeta meta;
         return meta;
     }
 
-    static ElementWrapper& get(EntryID* ent)
+    static Element& get(EntryID* ent)
     {
-        uint32_t id = ent->getOrInvalid();
-        static __thread size_t capacity{};
+        StaticMeta& meta = StaticMeta::instance();
         static __thread ThreadEntry* threadEntry{};
-        if(UNLIKELY(capacity <= id))
-        
-            getSlowReserveAndCache(ent,id,threadEntry,capacity);
-    
-        return threadEntry->element[id];
-    }
-
-    static void getSlowReserveAndCache(EntryID* ent,
-                                       uint32_t& id,
-                                       ThreadEntry*& threadEntry,
-                                       size_t& capacity)
-                                
-    {
-        auto& inst = instance();
-        threadEntry = inst.threadEntry_();
-        if(UNLIKELY(threadEntry->getElementsCapacity() <= id))
+        static __thread size_t capacity{};
+        uint32_t idval = ent->getID();
+        if(UNLIKELY(idval >= capacity))
         {
-            inst.reserve(ent);
-            id = ent->getOrInvalid();
-        }   
-        capacity = threadEntry->getElementsCapacity();
-        
-    }
-    
-
-    static ThreadEntry* getThreadEntrySlow()
-    {
-        auto& inst = instance();
-        pthread_key_t key = inst.key_;
-        ThreadEntry* threadEntry = static_cast<ThreadEntry*>(pthread_getspecific(key));
-        if(threadEntry == nullptr)
-        {
-            ThreadEntryList *list = StaticMeta::getThreadEntryList();
-            static __thread ThreadEntry ThreadEntrySingLeton;
-            threadEntry = &ThreadEntrySingLeton;
-            
-            assert(threadEntry->list == nullptr);
-            assert(threadEntry->listNext == nullptr);
-
-            threadEntry->list = list;
-            threadEntry->listNext = list->head;
-            list->head = threadEntry;
-
-            list->count++;
-            threadEntry->meta = &inst;
-            pthread_setspecific(key,threadEntry);
-
+            meta.reserveAndCache(threadEntry,capacity,ent,idval);
         }
-
-        return threadEntry;
+        idval = ent->getID();
+        return threadEntry->elements_[idval];
     }
 
+    void reserveAndCache(ThreadEntry*& threadEntry,size_t& capacity,EntryID* ent,uint32_t& id)
+    {
+        StaticMeta& meta = StaticMeta::instance();
+        threadEntry = meta.threadEntry_();
+        if(LIKELY(id == InvalidEntryId))
+        {
+            //get an id and reserve head_
+            ent->getOrAllocate(&meta);
+            //update id
+            id = ent->getID();
+        }
+        assert(id != InvalidEntryId);
+        capacity = threadEntry->getElementCapacity();
+        //reserve enough space for threadEntry
+        if(UNLIKELY(id >= capacity))
+        {
+            meta.reserve(threadEntry,id);
+        }
+    }
 
+    static ThreadEntry* getThreadEntrySlow() // get ThreadEntry per thread , bind threadEntry_
+    {
+        StaticMeta& meta = StaticMeta::instance();
+        ThreadEntry* entry = static_cast<ThreadEntry*>(pthread_getspecific(meta.key_));
+        //set ThreadEntry and push it to the double list
+        if(entry == nullptr)
+        {
+            static __thread ThreadEntry threadEntry;
+            entry = &threadEntry;
+            pthread_setspecific(meta.key_,entry);
+            entry->meta = &meta;
+            meta.push_back(entry);
+            
+        }
+        return entry;
+    }
 };
-
 

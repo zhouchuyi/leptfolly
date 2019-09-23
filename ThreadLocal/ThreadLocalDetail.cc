@@ -1,178 +1,198 @@
+#include<string.h>
+
 #include"ThreadLocalDetail.h"
-#include<cstring>
 
-constexpr static double kSmallGrowthFactor = 1.1;
-constexpr static double kBigGrowthFactor = 1.7;
+//the factor when reserve the space of elements
+constexpr auto GrowthFactor = 1.5;
 
-void ThreadEntryNode::initIfZero(bool locked)
+//invoked by Element::set
+//add node to the double list
+void ThreadEntryNode::initIfZero()
 {
-    if(UNLIKELY(!next))
+    if(next_ == nullptr)
     {
-        if(locked)
-            parent->meta->pushBackLocked(parent,id);
-        else
-            parent->meta->pushBackUnLocked(parent,id);
+        assert(id_ != InvalidEntryId);
+        parent_->meta->pushBack(parent_,id_);   
     }
-
 }
-
 
 void ThreadEntryNode::push_back(ThreadEntry* head)
 {
-    ThreadEntryNode* hnode = &head->element[id].node;
-    ThreadEntryNode* pnode = &hnode->prev->element[id].node;
-    //current
-    next = head;
-    prev = pnode->parent;
-    
-    hnode->prev = parent;
-    pnode->next = parent;
+    auto& nnode = head->elements_[id_].node_;
+    auto& pnode = (*nnode.getPrev());
+    next_ = head;
+    prev_ = pnode.parent_;
+
+    nnode.prev_ = parent_;
+    pnode.next_ = parent_;
 }
 
+ThreadEntryNode* ThreadEntryNode::getNext()
+{
+    assert(next_ && id_ != InvalidEntryId);
+    return &next_->elements_[id_].node_;
+}
+
+ThreadEntryNode* ThreadEntryNode::getPrev()
+{
+    assert(prev_ && id_ != InvalidEntryId);
+    return &prev_->elements_[id_].node_;
+}
+
+//remove node from the double list
 void ThreadEntryNode::eraseZero()
 {
-    ThreadEntryNode* nnode = &next->element[id].node;
-    ThreadEntryNode* pnode = &prev->element[id].node;
+    if(prev_ == nullptr)
+        return;
+    auto& pnode = (*getPrev());
+    auto& nnode = (*getNext());
 
-    nnode->prev = prev;
-    pnode->next = next;
+    pnode.next_ = nnode.parent_;
+    nnode.prev_ = pnode.parent_;
 
-    prev = next =nullptr;
+    next_ = prev_ = nullptr;
 }
 
-StaticMetaBase::StaticMetaBase(const getThreadEntry& threadEntry,bool strict)
-    : strict_(strict),
-      mutex_(),
-      nextId_(1),
-      freeIds_(),
-      threadEntry_(threadEntry)
-{
-    head_.next = head_.prev = &head_;
-    pthread_key_create(&key_,&onThreadExit);
-    
-}
 
-ThreadEntryList* StaticMetaBase::getThreadEntryList()
-{
-    static __thread ThreadEntryList threadEntrylist;
-    return &threadEntrylist;
-}
 
-bool StaticMetaBase::dying()
-{
-    for (auto i = getThreadEntryList()->head; i; i = i->listNext)
-    {
-        if(i->removed_)
-            return true;
-    }
-    return false;    
-}
+StaticMetaBase::StaticMetaBase(const std::function<ThreadEntry*()>& threadEntry)
+ : threadEntry_(threadEntry),
+   mutex_(),
+   head_(),
+   nextId_(1)
+   {
+       head_.prev_ = head_.next_ = &head_;
+        pthread_key_create(&key_,&StaticMetaBase::onThreadExit);
+   }
 
-uint32_t StaticMetaBase::elementsCapacity() const
-{
-    ThreadEntry* threadEntry = threadEntry_();
-    return threadEntry->getElementsCapacity();
-}
 
-uint32_t StaticMetaBase::allocate(EntryID* ent)
-{
-    uint32_t id;
-    std::lock_guard<std::mutex> lk(mutex_);
-    
-    id = ent->value_.load();
-    if(id != kEntryIDINvalid)
-        return id;
 
-    if(!this->freeIds_.empty())
-    {
-        id = freeIds_.back();
-        freeIds_.pop_back();
-    }
-    else
-    {
-        id = nextId_++;
-    }
-    uint32_t old = ent->value_.exchange(id);
-    reserveHeadUnlocked(id);
+//give an id to entry
+uint32_t StaticMetaBase::allocate(EntryID* entry)
+{
+    //init value_
+    ThreadEntry* t = threadEntry_();
+    uint32_t id = nextId_++;
+    uint32_t oldidval = entry->value_.exchange(id);
+    assert(oldidval == InvalidEntryId);
+    //reserve head_
+    std::lock_guard<std::mutex> lock(mutex_);
+    reserveHead(id);
     return id;
 }
 
-ElementWrapper* StaticMetaBase::reallocate(ThreadEntry* threadEntry, uint32_t idval,size_t& newCapacity)
+
+//TODO ensure thread-safe
+//invoked by StaticMetaBase::allocate
+void StaticMetaBase::reserveHead(uint32_t idval)
 {
-    size_t smallCapacity = static_cast<size_t>((idval +5) * kSmallGrowthFactor);
-    size_t bigCapacity = static_cast<size_t>((idval + 5) * kBigGrowthFactor);
-    newCapacity = (threadEntry->meta && (bigCapacity <= threadEntry->meta->head_.getElementsCapacity())) ? bigCapacity : smallCapacity;
-    ElementWrapper* reallocated = static_cast<ElementWrapper*>(calloc(newCapacity,sizeof(ElementWrapper)));
+    if(idval < head_.getElementCapacity())
+        return;
+    size_t prevcapacity = head_.getElementCapacity();
+    size_t newcapacity;
+    Element* reallocated = reallocate(&head_,idval,newcapacity);
+    assert(reallocated);
+    if(prevcapacity != 0)
+    {
+        memcpy(reallocated,head_.elements_,sizeof(Element) * prevcapacity);
+    }
+    std::swap(head_.elements_,reallocated);
+    for (size_t i = prevcapacity; i < newcapacity; i++)
+    {
+        head_.elements_[i].node_.init(&head_,i);
+    }
+    
+    head_.setElementCapacity(newcapacity);
+    free(reallocated);
+}
+
+void StaticMetaBase::reserve(ThreadEntry* t,uint32_t idval)
+{
+    size_t prevcapacity = t->getElementCapacity();
+    size_t newcapacity;
+    if(prevcapacity > idval)
+        return;
+    Element* reallocated = reallocate(t,idval,newcapacity);
+    assert(reallocated);
+    if(prevcapacity != 0)
+    {
+        memcpy(reallocated,t->elements_,sizeof(Element) * prevcapacity);
+    }
+    std::swap(t->elements_,reallocated);
+    for (size_t i = prevcapacity; i < newcapacity; i++)
+    {
+        t->elements_[i].node_.initZero(t,i);
+    }
+    
+    t->setElementCapacity(newcapacity);
+    free(reallocated);
+}
+
+Element* StaticMetaBase::reallocate(ThreadEntry* t,uint32_t idval,size_t& newcapacity)
+{
+    newcapacity = (idval + 5) * GrowthFactor;
+    Element* reallocated = static_cast<Element*>(calloc(newcapacity,sizeof(Element)));
+    if(reallocated == nullptr)
+    {
+        throw std::bad_alloc();
+    }
     return reallocated;
 }
 
-//reserve enough space for head_
-void StaticMetaBase::reserveHeadUnlocked(uint32_t id)
+void StaticMetaBase::pushBack(ThreadEntry* threadEntry,uint32_t id)
 {
-    size_t prevCapacity = head_.getElementsCapacity();
-    if(prevCapacity <= id)
-    {
-        size_t newCapacity;
-        ElementWrapper* newElement = reallocate(&head_,id,newCapacity);
-        if(newElement == nullptr)
-            throw std::bad_alloc();
-        if(prevCapacity)
-            std::memcpy(newElement,head_.element,sizeof(ElementWrapper) * prevCapacity);
-        std::swap(head_.element,newElement);
-
-        for (size_t i = id; i < newCapacity; i++)
-        {
-            head_.element[id].node.init(&head_,i);
-        }
-        free(newElement);
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& node = threadEntry->elements_[id].node_;
+    node.push_back(&head_);
 }
 
-//reserve enough space for ThreadEntry::element
-void StaticMetaBase::reserve(EntryID* id)
+
+void StaticMetaBase::onThreadExit(void* ptr)
 {
-    uint32_t idval = id->getOrAllocate(*this);
-    ThreadEntry* threadEntry = threadEntry_();
-    size_t prevCapacity = threadEntry->getElementsCapacity();
-    if(prevCapacity > idval)
+    ThreadEntry* threadEntry = static_cast<ThreadEntry*>(ptr);
+    auto& meta = StaticMeta::instance();
+    size_t capacity = threadEntry->getElementCapacity();
+    {
+        std::lock_guard<std::mutex> lock(meta.mutex_);
+        meta.erase(threadEntry);
+        for (size_t i = 0; i < capacity; i++)
+        {
+            threadEntry->elements_[i].node_.eraseZero();
+        }
+    }    
+
+    for (size_t i = 0; i < capacity; i++)
+    {
+        threadEntry->elements_[i].dispose();
+    }
+    pthread_setspecific(meta.key_,nullptr);
+    free(threadEntry->elements_);
+
+}
+
+void StaticMetaBase::destroy(EntryID* ent)
+{
+
+    uint32_t idval = ent->getID();
+    if(idval == InvalidEntryId)
         return;
-    size_t newCapacity;
-    ElementWrapper* newElement = reallocate(threadEntry,idval,newCapacity);
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
+    std::vector<Element> elements;
 
-        if(prevCapacity == 0)
-            this->push_back(threadEntry);
-        if(newElement)
+    {
+        auto& node = head_.elements_[idval].node_;
+        std::lock_guard<std::mutex> lock(mutex_);
+        while(!node.empty())
         {
-            if(prevCapacity)
-                memcpy(newElement,threadEntry->element,sizeof(ElementWrapper) * prevCapacity);
-            std::swap(newElement,threadEntry->element);
-        
+            auto& nnode = (*node.getNext());
+            nnode.eraseZero();
+            elements.push_back(nnode.parent_->elements_[idval]);
         }
-        for (size_t i = idval; i < newCapacity; i++)
-        {
-            threadEntry->element[i].node.init(threadEntry,i);
-        }
-        
-        threadEntry->setElementCapacity(newCapacity);
+                
     }
 
-    free(newElement);
-
-}
-
-void StaticMetaBase::pushBackLocked(ThreadEntry* t,uint32_t id)
-{
-    if(!t->removed_)
+    for (auto & element : elements)
     {
-        std::lock_guard<std::mutex> lk(mutex_);
-        t->element[id].node.push_back(&head_);
+        element.dispose();
     }
-}
-
-void StaticMetaBase::pushBackUnLocked(ThreadEntry* t,uint32_t id)
-{
-    if(!t->removed_)
-    t->element[id].node.push_back(&head_);
+            
 }
